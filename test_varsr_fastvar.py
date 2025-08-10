@@ -150,23 +150,24 @@ def run_inference(args, fastvar_cfg):
                 # save final image at root (existing behavior)
                 final_out_path = os.path.join(output_name, ext_path)
                 image.save(final_out_path)
-                # unified per-image scales folder
-                base_name_no_ext = os.path.splitext(ext_path)[0]
-                scales_dir = os.path.join(output_name, f"{base_name_no_ext}_scales")
-                os.makedirs(scales_dir, exist_ok=True)
-                # save intermediates (color-fix each) sideX.png
-                if intermediates is not None:
-                    for side, mid_img in intermediates:
-                        mid_np = pt_to_numpy(mid_img[i:i+1])[0]
-                        mid_pil = numpy_to_pil(mid_np)[0]
-                        mid_pil = adain_color_fix(mid_pil, validation_image)
-                        mid_pil.save(os.path.join(scales_dir, f"side{side}.png"))
-                # also ensure final scale stored in scales folder (side = last patch size)
-                try:
-                    final_side = getattr(var, 'patch_nums', [None])[-1]
-                    image.save(os.path.join(scales_dir, f"side{final_side}.png"))
-                except Exception:
-                    pass
+                # 可选：仅在需要导出中间尺度时创建 scales 子目录
+                if fastvar_cfg.export_intermediate:
+                    base_name_no_ext = os.path.splitext(ext_path)[0]
+                    scales_dir = os.path.join(output_name, f"{base_name_no_ext}_scales")
+                    os.makedirs(scales_dir, exist_ok=True)
+                    # 保存中间尺度 (sideX.png)
+                    if intermediates is not None:
+                        for side, mid_img in intermediates:
+                            mid_np = pt_to_numpy(mid_img[i:i+1])[0]
+                            mid_pil = numpy_to_pil(mid_np)[0]
+                            mid_pil = adain_color_fix(mid_pil, validation_image)
+                            mid_pil.save(os.path.join(scales_dir, f"side{side}.png"))
+                    # 复制最终尺度到 scales 目录
+                    try:
+                        final_side = getattr(var, 'patch_nums', [None])[-1]
+                        image.save(os.path.join(scales_dir, f"side{final_side}.png"))
+                    except Exception:
+                        pass
 
     if dist.get_rank() == 0:
         print(f"[FastVAR-Test] enable_fastvar={fastvar_cfg.enable_fastvar} second_last_ratio={fastvar_cfg.second_last_ratio} last_ratio={fastvar_cfg.last_ratio} later_layer_start={fastvar_cfg.later_layer_start} min_keep={fastvar_cfg.min_keep}")
