@@ -68,7 +68,7 @@ class TestDataset(data.Dataset):
             example["conditioning_pixel_values"] = self.img_preproc(LR_image_t).squeeze(0) * 2.0 - 1.0
 
         example["label_B"] = 0
-        fp.close()
+        # fp.close()
     
         return example
 
