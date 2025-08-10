@@ -95,3 +95,60 @@ I am very pleased to communicate with you and will maintain this repository duri
 
 ## Acknowledgments
 Some codes are brought from [VAR](https://github.com/FoundationVision/VAR), [MAR](https://github.com/LTH14/mar) and [HART](https://github.com/mit-han-lab/hart). Thanks for their excellent works.
+
+## 🔥 FastVAR 推理加速使用说明 (Token Pruning)
+
+我们在 `test_varsr_fastvar.py` 中加入 FastVAR 训练后免调参的 token 剪枝, 通过在后期尺度丢弃低重要性 tokens 减少计算。
+
+### 参数列表
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `--fastvar` | 启用 FastVAR 剪枝 | False |
+| `--fastvar_second_last_ratio` | 倒数第二尺度丢弃比例 (drop ratio) | 0.4 |
+| `--fastvar_last_ratio` | 最后尺度丢弃比例 | 0.3 |
+| `--fastvar_later_layer_start` | 每尺度从该层 index (0-based) 开始剪 | 3 |
+| `--fastvar_min_keep` | 每层最少保留 tokens | 64 |
+| `--fastvar_quiet` | 静默: 不打印逐层 Debug | False |
+| `--export_intermediate` | 导出中间尺度重建图 | False |
+| `--intermediate_max` | 导出中间尺度最大数量 | 10 |
+
+注意：`*_ratio` 为丢弃比例 (drop)，实际保留≈ `1 - ratio` 但受 `--fastvar_min_keep` 约束。
+
+### 输出
+启用 `--export_intermediate` 后，最终图所在目录新增 `<basename>_scales/side<patch>.png`，含多个尺度及最终尺度一份。
+
+### 常用示例
+适中剪枝：
+```bash
+python test_varsr_fastvar.py --fastvar --fastvar_second_last_ratio 0.4 --fastvar_last_ratio 0.3
+```
+仅剪倒数第二尺度：
+```bash
+python test_varsr_fastvar.py --fastvar --fastvar_second_last_ratio 0.5 --fastvar_last_ratio 0
+```
+激进实验：
+```bash
+python test_varsr_fastvar.py --fastvar --fastvar_second_last_ratio 0.99 --fastvar_last_ratio 0 --fastvar_min_keep 64
+```
+导出前 5 个中间尺度并静默：
+```bash
+python test_varsr_fastvar.py --fastvar --fastvar_second_last_ratio 0.4 --fastvar_last_ratio 0.3 \
+  --fastvar_quiet --export_intermediate --intermediate_max 5
+```
+
+### 调参建议
+- 先用 0.3~0.5 观察质量/速度，再逐步提高。
+- 质量差：降低 drop ratio 或增大 `--fastvar_min_keep` (如 128)。
+- 需要更稳：增大 `--fastvar_later_layer_start` 使前几层不剪。
+
+### 对比基准
+```bash
+# baseline (无剪枝)
+python test_varsr_fastvar.py
+# FastVAR
+python test_varsr_fastvar.py --fastvar --fastvar_second_last_ratio 0.4 --fastvar_last_ratio 0.3 --fastvar_quiet
+```
+比较总耗时与质量指标即可评估加速性价比。
+
+---
+集成提示（其它脚本）：参考 `test_varsr_fastvar.py`：构造 VAR_RoPE 时加 `enable_fastvar_prune=True` 与 `fastvar_override_map`；运行时用 `autoregressive_infer_cfg(..., return_intermediate=True)` 获取中间尺度。

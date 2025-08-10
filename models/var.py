@@ -1,6 +1,6 @@
 import math
 from functools import partial
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Dict
 
 import torch
 import torch.nn as nn
@@ -10,6 +10,7 @@ from torch.nn import functional as F
 import dist
 from models.basic_var import AdaLNBeforeHead
 from models.basic_var import AdaLNSelfAttn_RoPE, precompute_freqs_cis, precompute_freqs_cis_cross, precompute_freqs_cis_zeros
+from models.fastvar_utils import FastVarPruner, attach_fastvar_pruner_to_blocks
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
 from models.diffusion.diffloss import DiffLoss
@@ -87,12 +88,21 @@ class VAR_RoPE(nn.Module):
         attn_l2_norm=False,
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
         flash_if_available=True, fused_if_available=True,
+        # ---- FastVAR options ----
+        enable_fastvar_prune: bool = False,
+        fastvar_later_layer_start: int = 3,
+        fastvar_min_keep: int = 32,
+        fastvar_override_map: Optional[Dict[int, float]] = None,
     ):
         super().__init__()
         # 0. hyperparameters
         assert embed_dim % num_heads == 0
         self.Cvae, self.V = vae_local.Cvae, vae_local.vocab_size
         self.depth, self.C, self.D, self.num_heads = depth, embed_dim, embed_dim, num_heads
+        # FastVAR flags
+        self.enable_fastvar_prune = enable_fastvar_prune
+        self.fastvar_later_layer_start = fastvar_later_layer_start
+        self.fastvar_min_keep = fastvar_min_keep
         
         self.cond_drop_rate = cond_drop_rate
         self.prog_si = -1   # progressive training
@@ -168,6 +178,34 @@ class VAR_RoPE(nn.Module):
             ) 
             for block_idx in range(depth)
         ])
+        # Attach FastVAR pruner if enabled
+        if self.enable_fastvar_prune:
+            if fastvar_override_map is not None:
+                prune_map = fastvar_override_map
+            else:
+                # default: prune two smallest of last four scales (drop ratios 0.4, 0.5) keep others
+                if len(self.patch_nums) >= 4:
+                    target_sides = self.patch_nums[-4:]
+                else:
+                    target_sides = self.patch_nums[1:] if len(self.patch_nums) > 1 else []
+                prune_map = {}
+                if len(target_sides) >= 2:
+                    prune_map[target_sides[0]] = 0.4
+                    prune_map[target_sides[1]] = 0.5
+                # remaining last two scales no pruning by default
+            self.fastvar_pruner = FastVarPruner(prune_scale_map=prune_map,
+                                                later_layer_start=self.fastvar_later_layer_start,
+                                                min_keep=self.fastvar_min_keep,
+                                                quiet=getattr(self, 'fastvar_quiet', False))
+            # ensure quiet propagates if attribute updated later
+            self.fastvar_pruner.quiet = getattr(self, 'fastvar_quiet', False)
+            attach_fastvar_pruner_to_blocks(self.blocks, self.fastvar_pruner)
+            for _b in self.blocks:
+                if hasattr(_b, 'use_checkpoint'):
+                    _b.use_checkpoint = False
+            print(f"[FastVAR] Enabled pruning with map={prune_map}, later_layer_start={self.fastvar_later_layer_start}, min_keep={self.fastvar_min_keep}")
+        else:
+            self.fastvar_pruner = None
         
         fused_add_norm_fns = [b.fused_add_norm_fn is not None for b in self.blocks]
         self.using_fused_add_norm_fn = any(fused_add_norm_fns)
@@ -262,7 +300,8 @@ class VAR_RoPE(nn.Module):
         self, B: int, text_hidden, lr_inp, negative_text, label_B,
         g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0, 
         more_smooth=False, lr_inp_scale=None, tile_flag=False,
-    ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
+        return_intermediate: bool = False, intermediate_max: int = 10,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, list]]:   # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
         :param B: batch size
@@ -297,8 +336,9 @@ class VAR_RoPE(nn.Module):
         cur_Lr = 1
         if lr_inp_scale is not None:
             next_token_map[:, -1, :] = next_token_map[:, -1, :] + self.word_embed(lr_inp_scale[:, 0]).repeat(2,1)
-        for b in self.blocks: 
+        for b in self.blocks:
             b.attn.kv_caching(True)
+        intermediates = [] if return_intermediate else None
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
             ratio = si / self.num_stages_minus_1
             if si > 0:
@@ -311,36 +351,45 @@ class VAR_RoPE(nn.Module):
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             x = next_token_map
             for i, b in enumerate(self.blocks):
-                AdaLNSelfAttn_RoPE.forward
-                x = b(x=x, cond_BD=cond_BD_or_gss,  freqs_cis=freqs_cis, attn_bias=None)
+                side_for_prune = pn if self.enable_fastvar_prune and x.shape[1] == pn * pn else None
+                x = b(x=x, cond_BD=cond_BD_or_gss, freqs_cis=freqs_cis, attn_bias=None,
+                      scale_side=side_for_prune,
+                      layer_idx_in_scale=i)
             logits_BlV = self.get_logits(x, cond_BD)
             if si == self.num_stages_minus_1:
                 last_layer_cond = x
-            
+
             t = cfg * ratio
             logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
 
             if si == 0:
                 logits_BlV = logits_BlV[:, [-1], :]
-            
+
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
-            if not more_smooth: # this is the default case
-                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
-            else:   # not used when evaluating FID/IS/Precision/Recall
-                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
+            if not more_smooth:
+                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)
+            else:
+                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
                 h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-            
+
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
             f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
-            if si != self.num_stages_minus_1:   # prepare for next stage
+            if return_intermediate and (len(intermediates) < intermediate_max):
+                try:
+                    img_mid = self.vae_proxy[0].fhat_to_img(f_hat.detach()).add(1).mul(0.5).clamp_(0,1)
+                    intermediates.append((int(pn), img_mid))
+                except Exception:
+                    pass
+            if si != self.num_stages_minus_1:
                 next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
                 next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
                 if lr_inp_scale is not None:
                     next_token_map = next_token_map + self.word_embed(lr_inp_scale[:, cur_Lr:cur_Lr + self.patch_nums[si+1] ** 2])
                     cur_Lr += self.patch_nums[si+1] ** 2
-                next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
+                next_token_map = next_token_map.repeat(2, 1, 1)
         
-        for b in self.blocks: 
+        # disable KV caching after autoregressive generation loop
+        for b in self.blocks:
             b.attn.kv_caching(False)
 
         final_stage = 0
@@ -362,9 +411,16 @@ class VAR_RoPE(nn.Module):
             f_hat += h_BChw_diff
 
         if tile_flag:
+            if return_intermediate:
+                return f_hat, intermediates
             return f_hat
         else:
-            return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
+            out_img = self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
+            if self.enable_fastvar_prune and self.fastvar_pruner is not None:
+                print(self.fastvar_pruner.summary())
+            if return_intermediate:
+                return out_img, intermediates
+            return out_img   # de-normalize, from [-1, 1] to [0, 1]
 
     def forward(self, x_BLCv_wo_first_l: torch.Tensor, label_B, lr_inp, text_hidden,
         last_layer_gt: torch.Tensor = None,
@@ -424,8 +480,9 @@ class VAR_RoPE(nn.Module):
         
         AdaLNSelfAttn_RoPE.forward
         for i, b in enumerate(self.blocks):
-            x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss,  
-                    freqs_cis=freqs_cis, attn_bias=attn_bias)
+            x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss,
+                      freqs_cis=freqs_cis, attn_bias=attn_bias,
+                      scale_side=None, layer_idx_in_scale=i)
         last_layer_cond = x_BLC[:, self.L + self.context_token - 1 - self.last_level_pns :, :]
         x_BLC_logits = self.get_logits(x_BLC.float(), cond_BD)
         x_BLC = x_BLC_logits[:, self.context_token - 1 :, :]
@@ -539,12 +596,19 @@ class ImgVAR_RoPE(nn.Module):
         attn_l2_norm=False,
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
         flash_if_available=True, fused_if_available=True,
+        enable_fastvar_prune: bool = False,
+        fastvar_later_layer_start: int = 3,
+        fastvar_min_keep: int = 32,
+        fastvar_override_map: Optional[Dict[int, float]] = None,
     ):
         super().__init__()
         # 0. hyperparameters
         assert embed_dim % num_heads == 0
         self.Cvae, self.V = vae_local.Cvae, vae_local.vocab_size
         self.depth, self.C, self.D, self.num_heads = depth, embed_dim, embed_dim, num_heads
+        self.enable_fastvar_prune = enable_fastvar_prune
+        self.fastvar_later_layer_start = fastvar_later_layer_start
+        self.fastvar_min_keep = fastvar_min_keep
         
         self.cond_drop_rate = cond_drop_rate
         self.prog_si = -1   # progressive training
@@ -614,6 +678,28 @@ class ImgVAR_RoPE(nn.Module):
             ) 
             for block_idx in range(depth)
         ])
+        if self.enable_fastvar_prune:
+            if fastvar_override_map is not None:
+                prune_map = fastvar_override_map
+            else:
+                if len(self.patch_nums) >= 4:
+                    target_sides = self.patch_nums[-4:]
+                else:
+                    target_sides = self.patch_nums[1:] if len(self.patch_nums) > 1 else []
+                prune_map = {}
+                if len(target_sides) >= 2:
+                    prune_map[target_sides[0]] = 0.4
+                    prune_map[target_sides[1]] = 0.5
+            self.fastvar_pruner = FastVarPruner(prune_scale_map=prune_map,
+                                                later_layer_start=self.fastvar_later_layer_start,
+                                                min_keep=self.fastvar_min_keep)
+            attach_fastvar_pruner_to_blocks(self.blocks, self.fastvar_pruner)
+            for _b in self.blocks:
+                if hasattr(_b, 'use_checkpoint'):
+                    _b.use_checkpoint = False
+            print(f"[FastVAR] ImgVAR pruning enabled with map={prune_map}")
+        else:
+            self.fastvar_pruner = None
         
         fused_add_norm_fns = [b.fused_add_norm_fn is not None for b in self.blocks]
         self.using_fused_add_norm_fn = any(fused_add_norm_fns)
@@ -721,7 +807,9 @@ class ImgVAR_RoPE(nn.Module):
             x = next_token_map
             for i, b in enumerate(self.blocks):
                 AdaLNSelfAttn_RoPE.forward
-                x = b(x=x, cond_BD=cond_BD_or_gss,  freqs_cis=freqs_cis, attn_bias=None)
+                x = b(x=x, cond_BD=cond_BD_or_gss,  freqs_cis=freqs_cis, attn_bias=None,
+                      scale_side=pn if self.enable_fastvar_prune else None,
+                      layer_idx_in_scale=i)
             logits_BlV = self.get_logits(x, cond_BD)
             if si == self.num_stages_minus_1:
                 last_layer_cond = x
@@ -804,7 +892,8 @@ class ImgVAR_RoPE(nn.Module):
         
         AdaLNSelfAttn_RoPE.forward
         for i, b in enumerate(self.blocks):
-            x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss,  freqs_cis=freqs_cis, attn_bias=attn_bias)
+            x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss,  freqs_cis=freqs_cis, attn_bias=attn_bias,
+                      scale_side=None, layer_idx_in_scale=i)
         last_layer_cond = x_BLC[:, self.L + self.context_token - 1 - self.last_level_pns :, :]
         x_BLC_logits = self.get_logits(x_BLC.float(), cond_BD)
         x_BLC = x_BLC_logits[:, self.context_token - 1 :, :]
@@ -907,3 +996,50 @@ class ImgVAR_RoPE(nn.Module):
     
     def extra_repr(self):
         return f'drop_path_rate={self.drop_path_rate:g}'
+
+
+# ------------------------
+# FastVAR helper builders
+# ------------------------
+def build_var_rope_with_fastvar(
+    vae_local: VQVAE,
+    patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),
+    prune_ratios=(0.4, 0.3),  # (ratio_drop_second_last, ratio_drop_last)
+    later_layer_start: int = 3,
+    min_keep: int = 64,
+    **kwargs,
+):
+    """Convenience factory: enable FastVAR only on the last two autoregressive stages.
+
+    Parameters
+    ----------
+    vae_local : VQVAE
+        The VQVAE instance.
+    patch_nums : tuple
+        Progressive side lengths per stage.
+    prune_ratios : (float, float)
+        Drop ratios (NOT keep) for (second_last, last) stage. Set any to 0.0 to disable that stage pruning.
+    later_layer_start : int
+        Start pruning from this (0-based) layer index inside each stage.
+    min_keep : int
+        Minimum tokens to keep after pruning.
+    kwargs : dict
+        Forwarded to VAR_RoPE constructor (e.g. depth, embed_dim, etc.).
+    """
+    assert len(patch_nums) >= 2, "Need at least two stages to prune last two."
+    second_last_side, last_side = patch_nums[-2], patch_nums[-1]
+    r2, r1 = prune_ratios  # order: second_last, last
+    override_map = {}
+    if r2 > 0: override_map[second_last_side] = float(r2)
+    if r1 > 0: override_map[last_side] = float(r1)
+    model = VAR_RoPE(
+        vae_local=vae_local,
+        patch_nums=patch_nums,
+        enable_fastvar_prune=True,
+        fastvar_later_layer_start=later_layer_start,
+        fastvar_min_keep=min_keep,
+        fastvar_override_map=override_map,
+        **kwargs,
+    )
+    return model
+

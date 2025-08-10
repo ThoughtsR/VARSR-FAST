@@ -80,7 +80,7 @@ class Args(Tap):
     workers: int = 0        # num workers; 0: auto, -1: don't use multiprocessing in DataLoader
     
     # progressive training
-    pg: float = 0.0         # >0 for use progressive training during [0%, this] of training
+    pg: float = 0.0         # >0 for use progressive training during [0 percent, this] of training
     pg0: int = 4            # progressive initial stage, 0: from the 1st token map, 1: from the 2nd token map, etc
     pgwp: float = 0         # num of warmup epochs at each progressive stage
     

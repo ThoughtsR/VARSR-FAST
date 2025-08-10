@@ -400,25 +400,74 @@ class AdaLNSelfAttn_RoPE(nn.Module):
         self.fused_add_norm_fn = None
     
     # NOTE: attn_bias is None during inference because kv cache is enabled
-    def forward_part(self, x, cond_BD, freqs_cis, attn_bias):   # C: embed_dim, D: cond_dim
+    def forward_part(self, x, cond_BD, freqs_cis, attn_bias, scale_side: int = None, layer_idx_in_scale: int = None):   # C: embed_dim, D: cond_dim
         if self.shared_aln:
             gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
         else:
             if self.ada_lin_flag:
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = self.ada_lin(cond_BD).view(-1, 1, 6, self.C).unbind(2)
-        if self.ada_lin_flag:
-            x = x + self.drop_path(self.attn( self.ln_wo_grad(x).mul(scale1.add(1)).add_(shift1), freqs_cis=freqs_cis, attn_bias=attn_bias ).mul_(gamma1))
-            x = x + self.drop_path(self.ffn( self.ln_wo_grad(x).mul(scale2.add(1)).add_(shift2) ).mul(gamma2)) # this mul(gamma2) cannot be in-placed when FusedMLP is used
+        pruner = getattr(self, 'fastvar_pruner', None)
+        kept_idx = kept_mask = base_full = None
+        original_L = x.shape[1]
+        if pruner is not None and scale_side is not None and layer_idx_in_scale is not None:
+            if x.shape[1] != scale_side * scale_side:
+                # Sequence length includes context or multi-scale tokens; skip pruning to avoid shape mismatch
+                if layer_idx_in_scale == 0 and pruner.is_scale_pruned(scale_side):
+                    if not getattr(pruner, 'quiet', False):
+                        print(f"[FastVAR][Debug] Skip pruning stage side={scale_side} due to length {x.shape[1]} != {scale_side*scale_side}")
+                pruner = None  # disable for this call
+            # Debug gating
+            if layer_idx_in_scale == 0 and pruner.is_scale_pruned(scale_side):
+                if not getattr(pruner, 'quiet', False):
+                    print(f"[FastVAR][Debug] Enter stage side={scale_side}; later_layer_start={pruner.later_layer_start}")
+            if pruner.should_prune(scale_side, layer_idx_in_scale):
+                if not getattr(pruner, 'quiet', False):
+                    print(f"[FastVAR][Debug] PruneCheck side={scale_side} layer={layer_idx_in_scale} original_L={original_L}")
+            x_attn_in, freqs_in, kept_idx, base_full, kept_mask, original_L = pruner.prune_if_needed(
+                x=self.ln_wo_grad(x).mul(scale1.add(1)).add_(shift1) if self.ada_lin_flag else self.ln_wo_grad(x),
+                freqs_cis=freqs_cis,
+                side=scale_side,
+                layer_idx=layer_idx_in_scale,
+                prev_scale_cache=getattr(self, 'prev_scale_cache_attn', None)
+            )
+            attn_out_small = self.attn(x_attn_in, freqs_cis=freqs_in, attn_bias=attn_bias)
+            attn_out_full = pruner.reconstruct(attn_out_small, kept_idx, base_full, kept_mask, original_L)
+            if original_L == scale_side * scale_side:
+                self.prev_scale_cache_attn = attn_out_full.detach()
+            x = x + self.drop_path(attn_out_full.mul_(gamma1)) if self.ada_lin_flag else x + self.drop_path(attn_out_full)
         else:
-            x = x + self.drop_path(self.attn( self.ln_wo_grad(x), freqs_cis=freqs_cis, attn_bias=attn_bias))
-            x = x + self.drop_path(self.ffn( self.ln_wo_grad(x))) # this mul(gamma2) cannot be in-placed when FusedMLP is used
+            if self.ada_lin_flag:
+                x = x + self.drop_path(self.attn( self.ln_wo_grad(x).mul(scale1.add(1)).add_(shift1), freqs_cis=freqs_cis, attn_bias=attn_bias ).mul_(gamma1))
+            else:
+                x = x + self.drop_path(self.attn( self.ln_wo_grad(x), freqs_cis=freqs_cis, attn_bias=attn_bias))
+
+        # FFN pruning (reuse pruner with separate cache)
+        if pruner is not None and scale_side is not None and layer_idx_in_scale is not None:
+            x_ffn_in = self.ln_wo_grad(x).mul(scale2.add(1)).add_(shift2) if self.ada_lin_flag else self.ln_wo_grad(x)
+            x_ffn_small, _, kept_idx2, base_full2, kept_mask2, original_L2 = pruner.prune_if_needed(
+                x=x_ffn_in,
+                freqs_cis=freqs_cis,
+                side=scale_side,
+                layer_idx=layer_idx_in_scale,  # same gating policy
+                prev_scale_cache=getattr(self, 'prev_scale_cache_ffn', None)
+            )
+            ffn_small = self.ffn(x_ffn_small)
+            ffn_full = pruner.reconstruct(ffn_small, kept_idx2, base_full2, kept_mask2, original_L2)
+            if original_L2 == scale_side * scale_side:
+                self.prev_scale_cache_ffn = ffn_full.detach()
+            x = x + self.drop_path(ffn_full.mul(gamma2)) if self.ada_lin_flag else x + self.drop_path(ffn_full)
+        else:
+            if self.ada_lin_flag:
+                x = x + self.drop_path(self.ffn( self.ln_wo_grad(x).mul(scale2.add(1)).add_(shift2) ).mul(gamma2))
+            else:
+                x = x + self.drop_path(self.ffn( self.ln_wo_grad(x)))
         return x
     
-    def forward(self, x, cond_BD, freqs_cis, attn_bias):
+    def forward(self, x, cond_BD, freqs_cis, attn_bias, scale_side: int = None, layer_idx_in_scale: int = None):
         if self.use_checkpoint:
-            x = checkpoint.checkpoint(self.forward_part, x, cond_BD, freqs_cis, attn_bias)
+            x = checkpoint.checkpoint(self.forward_part, x, cond_BD, freqs_cis, attn_bias, scale_side, layer_idx_in_scale)
         else:
-            x = self.forward_part(x, cond_BD, freqs_cis, attn_bias)
+            x = self.forward_part(x, cond_BD, freqs_cis, attn_bias, scale_side, layer_idx_in_scale)
 
         return x
     def extra_repr(self) -> str:
